@@ -774,7 +774,10 @@ async def compose_reply(store: GuildStore, channel_id: int, trigger_author: str,
         print(f"[reply] LLM error: {e}", flush=True)
         return None
     text = text.strip().strip('"')
-    return text[: CFG["max_reply_chars"] * 2] if text else None
+    if not text:
+        return None
+    cap = 2000 if match_started_template(store, text) else CFG["max_reply_chars"] * 2
+    return text[:cap]
 
 
 async def compose_addressed_reply(store: GuildStore, channel_id: int, author_name: str, web=None):
@@ -811,7 +814,9 @@ async def compose_addressed_reply(store: GuildStore, channel_id: int, author_nam
     text = (text or "").strip()
     if not text or text.upper() == "NO" or text.startswith("NO\n"):
         return None
-    return text.strip('"')[: CFG["max_reply_chars"] * 2]
+    text = text.strip('"')
+    cap = 2000 if match_started_template(store, text) else CFG["max_reply_chars"] * 2
+    return text[:cap]
 
 
 # ---------------------------------------------------------------- Discord REST
@@ -951,17 +956,32 @@ def clean_output(text: str):
     return text or None
 
 
-def contains_long_template(store: GuildStore, text) -> bool:
-    """True when the composed text contains (most of) a registered long
-    template — those are read to the end, without the 3-line cap."""
+def match_started_template(store: GuildStore, text):
+    """Return the registered long template a composed reply has STARTED,
+    if any. The model rarely reproduces a template byte-for-byte (it
+    re-punctuates or rephrases, or starts from a middle verse), so match
+    on any distinctive 16-char window from anywhere in the template."""
     if not text:
-        return False
+        return None
     flat = re.sub(r"\s+", "", text)
     for it in _norm_templates(_load_json_list(store.dir / "templates.json")):
         t = re.sub(r"\s+", "", it["text"])
-        if len(t) >= 50 and (t in flat or t[:40] in flat):
-            return True
-    return False
+        if len(t) < 50:
+            continue
+        if t in flat:
+            return it
+        # the model may start from the middle of a long template (asked to
+        # continue singing, it picks a later verse), so scan the whole text
+        for i in range(0, max(1, len(t) - 15)):
+            if t[i:i + 16] in flat:
+                return it
+    return None
+
+
+def contains_long_template(store: GuildStore, text) -> bool:
+    """True when the composed text contains or has started a registered
+    long template — those are read to the end, without the 3-line cap."""
+    return match_started_template(store, text) is not None
 
 
 async def human_send(channel_id: int, text: str, reply_to: int = None, urgent: bool = False,
@@ -1173,7 +1193,7 @@ async def semantic_fit(store: GuildStore, channel_id: int):
     return None
 
 
-STOP_RE = re.compile(r"ストップ|止めて|やめて|もういい|黙れ|ｽﾄｯﾌﾟ|stop", re.I)
+STOP_RE = re.compile(r"ストップ|ｽﾄｯﾌﾟ|止ま|止め|やめ|もういい|黙れ|stop", re.I)
 
 
 def split_paragraphs(text: str):
@@ -1195,18 +1215,73 @@ def split_paragraphs(text: str):
     return paras or [text]
 
 
-async def send_template_paragraphs(channel_id: int, text: str, store: GuildStore):
-    """Send a long memorized template verbatim, one paragraph at a time
-    from the top. A human saying ストップ/やめて etc. in the channel sets
-    para_stop and the remaining paragraphs are not sent."""
+FRESH_START_RE = re.compile(r"最初から|はじめから|最初っから")
+
+
+def _norm_with_map(text: str):
+    chars, idx = [], []
+    for i, ch in enumerate(text):
+        if not ch.isspace():
+            chars.append(ch)
+            idx.append(i)
+    return "".join(chars), idx
+
+
+def template_resume_offset(store: GuildStore, channel_id: int, text: str, st) -> int:
+    """How far into this template the conversation already is: the furthest
+    point matched by recent channel messages, plus recorded playback
+    progress. 0 when there is nothing to resume from — and 0 again when
+    the template was basically finished, so a new request restarts it."""
+    best = 0
+    prog = st.get("para_progress") or {}
+    if prog.get("text") == text and time.time() - prog.get("ts", 0) < 1800:
+        best = max(best, int(prog.get("offset", 0)))
+    norm, idx = _norm_with_map(text)
+    if len(norm) >= 12:
+        # scan recent messages as ONE stream: the bot sends one line per
+        # message, so template windows spanning line breaks only match
+        # across the concatenation of consecutive messages
+        stream = ""
+        for m in store.recent(channel_id, 14):
+            if time.time() - m.get("ts", 0) > 900:
+                continue
+            stream += re.sub(r"\s+", "", m.get("content") or "")
+        if len(stream) >= 12:
+            sm = _difflib.SequenceMatcher(None, stream, norm, autojunk=False)
+            for a, b, size in reversed(sm.get_matching_blocks()):
+                if size >= 12:
+                    best = max(best, idx[b + size - 1] + 1)
+                    break
+    if best >= len(text) - 20:
+        return 0
+    return best
+
+
+async def send_template_paragraphs(channel_id: int, text: str, store: GuildStore,
+                                   resume: bool = True):
+    """Send a long memorized template verbatim, one paragraph at a time.
+    When the conversation is already partway into the template (fragments
+    sung, or a playback stopped midway), resume from there instead of
+    restarting at the top. A human saying ストップ/止まって etc. in the
+    channel sets para_stop and the remaining paragraphs are not sent."""
     st = channel_state[channel_id]
     if st.get("para_active"):
         return
     paras = split_paragraphs(text)
+    ends, pos = [], 0
+    for p in paras:
+        j = text.find(p, pos)
+        if j < 0:
+            j = pos
+        ends.append(j + len(p))
+        pos = j + len(p)
+    start = template_resume_offset(store, channel_id, text, st) if resume else 0
     st["para_active"] = True
     st["para_stop"] = False
     try:
         for i, p in enumerate(paras):
+            if ends[i] <= start:
+                continue
             if st.get("para_stop"):
                 break
             if i > 0:
@@ -1225,6 +1300,7 @@ async def send_template_paragraphs(channel_id: int, text: str, store: GuildStore
             store.add({"id": int(resp.get("id", 0)), "author": rest.bot_name,
                        "content": p, "channel_id": channel_id, "ts": time.time()})
             st["last_bot_msg"] = time.time()
+            st["para_progress"] = {"text": text, "offset": ends[i], "ts": time.time()}
     finally:
         st["para_active"] = False
 
@@ -1263,6 +1339,14 @@ async def maybe_ambient(channel_id: int, guild_id: int):
         text = await compose_reply(store, channel_id, last_human,
                                    hint=fit if fit_fresh else None)
         if text:
+            started = match_started_template(store, text)
+            if (started and "○○" not in started["text"]
+                    and "〇〇" not in started["text"]):
+                st["last_ambient"] = time.time()
+                fit_used[f"template:{started['text']}"] = time.time()
+                st["para_task"] = asyncio.create_task(
+                    send_template_paragraphs(channel_id, started["text"], store))
+                return
             st["last_ambient"] = time.time()
             if await human_send(channel_id, text, urgent=fit_fresh, full=contains_long_template(store, text)):
                 if fit_fresh:
@@ -1828,6 +1912,17 @@ async def run_addressed(channel_id: int, guild_id: int, d: dict, display: str, c
             text = text2
         target_id, target_content = newer[-1]["id"], newer[-1]["content"]
     if text:
+        started = match_started_template(store, text)
+        if (started and "○○" not in started["text"]
+                and "〇〇" not in started["text"]):
+            st["last_ambient"] = time.time()
+            await send_template_paragraphs(channel_id, started["text"], store,
+                                           resume=not FRESH_START_RE.search(target_content))
+            record_trigger(st, author_id, target_content)
+            if st["pending_task"] and not st["pending_task"].done():
+                st["pending_task"].cancel()
+            await _ts.__aexit__()
+            return
         st["last_ambient"] = time.time()
         if await human_send(channel_id, text, reply_to=target_id, urgent=True, directed=True, full=contains_long_template(store, text)):
             record_trigger(st, author_id, target_content)
@@ -1857,6 +1952,9 @@ async def handle_dm(d: dict):
     store.add({"id": int(d["id"]), "author": display, "author_id": int(author.get("id", 0)), "content": stored,
                "channel_id": channel_id, "ts": time.time()})
     st = channel_state[channel_id]
+    if st.get("para_active") and STOP_RE.search(content):
+        st["para_stop"] = True
+        return
     emb = await maybe_learn_from_message(store, channel_id, display, content)
     if emb:
         await rest.send_message(channel_id, None, embeds=[emb])
@@ -1883,10 +1981,18 @@ async def handle_dm(d: dict):
             target_id, target_content = newer[-1]["id"], newer[-1]["content"]
         sent = False
         if text:
-            sent = await human_send(channel_id, text, reply_to=target_id,
-                                    urgent=True, directed=True, full=contains_long_template(store, text))
-            if sent:
+            started = match_started_template(store, text)
+            if (started and "○○" not in started["text"]
+                    and "〇〇" not in started["text"]):
+                await send_template_paragraphs(channel_id, started["text"], store,
+                                               resume=not FRESH_START_RE.search(content))
+                sent = True
                 record_trigger(st, int(author.get("id", 0)), target_content)
+            else:
+                sent = await human_send(channel_id, text, reply_to=target_id,
+                                        urgent=True, directed=True, full=contains_long_template(store, text))
+                if sent:
+                    record_trigger(st, int(author.get("id", 0)), target_content)
         if not sent:
             await send_fallback_ack(channel_id)
 
@@ -1969,10 +2075,19 @@ async def handle_message(d: dict):
                 web = await web_lookup(content) if needs_web_lookup(content) else None
                 text = await compose_reply(store, channel_id, display, web=web)
                 if text:
-                    st["last_ambient"] = time.time()
-                    sent = await human_send(channel_id, text, reply_to=int(d["id"]), urgent=True, directed=True, full=contains_long_template(store, text))
-                    if sent:
+                    started = match_started_template(store, text)
+                    if (started and "○○" not in started["text"]
+                            and "〇〇" not in started["text"]):
+                        st["last_ambient"] = time.time()
+                        await send_template_paragraphs(channel_id, started["text"], store,
+                                                       resume=not FRESH_START_RE.search(content))
+                        sent = True
                         record_trigger(st, int(author["id"]), content)
+                    else:
+                        st["last_ambient"] = time.time()
+                        sent = await human_send(channel_id, text, reply_to=int(d["id"]), urgent=True, directed=True, full=contains_long_template(store, text))
+                        if sent:
+                            record_trigger(st, int(author["id"]), content)
             if not sent:
                 await send_fallback_ack(channel_id)
         if st["pending_task"] and not st["pending_task"].done():
