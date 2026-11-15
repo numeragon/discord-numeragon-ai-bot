@@ -1,0 +1,15 @@
+[Unit]
+Description=Discord server-vibe companion bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hatch/workspace/discord-bot
+EnvironmentFile=/etc/discord-vibe-bot.env
+ExecStart=/home/hatch/workspace/discord-bot/.venv/bin/python /home/hatch/workspace/discord-bot/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

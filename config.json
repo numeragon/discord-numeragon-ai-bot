@@ -1,0 +1,89 @@
+{
+  "ambient_cooldown_sec": 25,
+  "ambient_enabled": true,
+  "ambient_pause_sec": [
+    0,
+    0
+  ],
+  "ambient_probability": 0.95,
+  "context_messages": 25,
+  "guild_allowlist": [],
+  "llm_backend": "openai",
+  "max_reply_chars": 280,
+  "max_stored_messages": 2000,
+  "min_burst_messages": 2,
+  "min_burst_users": 1,
+  "openai_base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+  "openai_model": "gemini-3.1-flash-lite-preview",
+  "owner_id": 1180881836398870543,
+  "profile_sample": 300,
+  "profile_update_every": 150,
+  "relay_timeout_sec": 300,
+  "addressed_detection": true,
+  "addressed_window_sec": 900,
+  "addressed_judge_cooldown_sec": 20,
+  "bot_aliases": [
+    "オナホールちゃん"
+  ],
+  "knowledge_update_every": 150,
+  "knowledge_max_chars": 1600,
+  "reply_quote_probability": 0.4,
+  "presence_rotate_sec": 600,
+  "presence_texts": [
+    "ぬめらごんのコピー体です",
+    "ぬめらごん2号機、稼働中",
+    "本体は寝てるので代わりに来ました"
+  ],
+  "llm_reasoning_effort": "low",
+  "openai_fallback_models": [
+    "gemini-3-flash-preview"
+  ],
+  "groq_models": [
+    "qwen/qwen3.8-27b",
+    "openai/gpt-oss-120b"
+  ],
+  "llm_chain": [
+    {
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "key_env": "OPENAI_API_KEY",
+      "model": "gemini-3.1-flash-lite-preview"
+    },
+    {
+      "base_url": "https://api.groq.com/openai/v1",
+      "key_env": "GROQ_API_KEY",
+      "model": "qwen/qwen3.8-27b"
+    },
+    {
+      "base_url": "https://api.groq.com/openai/v1",
+      "key_env": "GROQ_API_KEY",
+      "model": "openai/gpt-oss-120b"
+    },
+    {
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "key_env": "OPENAI_API_KEY",
+      "model": "gemini-3-flash-preview"
+    }
+  ],
+  "llm_chain_addressed": [
+    {
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "key_env": "OPENAI_API_KEY",
+      "model": "gemini-3-flash-preview"
+    },
+    {
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "key_env": "OPENAI_API_KEY",
+      "model": "gemini-3.1-flash-lite-preview"
+    },
+    {
+      "base_url": "https://api.groq.com/openai/v1",
+      "key_env": "GROQ_API_KEY",
+      "model": "qwen/qwen3.8-27b"
+    },
+    {
+      "base_url": "https://api.groq.com/openai/v1",
+      "key_env": "GROQ_API_KEY",
+      "model": "openai/gpt-oss-120b"
+    }
+  ]
+}

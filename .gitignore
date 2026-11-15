@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+data/*
+!data/memes.json
+*.muse-github-snapshot-sync.json
+*.muse-github-snapshot-sync.json.tmp-*
