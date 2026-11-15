@@ -21,12 +21,15 @@ Secrets live in .env. Per-guild data under data/<guild_id>/.
 """
 
 import asyncio
+import base64
 import html as html_mod
 import json
 import os
 import random
 import re
+import shutil
 import sys
+import tempfile
 import time
 from collections import defaultdict, deque
 from datetime import datetime
@@ -491,6 +494,172 @@ async def llm(system: str, user: str, kind: str = "ambient") -> str:
     return await llm_openai(system, user, kind)
 
 
+# ---------------------------------------------------------------- image vision
+# Posted images used to be invisible to the bot: an image-only message has
+# empty content, so it was never even stored, and the bot could only drop
+# a fixed reaction. Now, at the single intake point shared by the guild
+# and DM paths, the first image of a message (attachment, GIF-picker
+# embed, or the replied-to message's image) is described once by a Gemini
+# vision model and the description is stored as part of the message text.
+# Every downstream path (ambient, addressed, mention, DM) then reacts to
+# the image content through the normal transcript, in persona voice, with
+# no per-path changes.
+VISION_TMP = DATA / "vision_tmp"
+VISION_TMP.mkdir(exist_ok=True)
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".bmp"}
+VISION_DOWNLOAD_LIMIT = 10 * 1024 * 1024
+VISION_COOLDOWN_SEC = 12  # per channel, skipped only when not forced
+
+VISION_PROMPT = (
+    "この画像を、Discordの会話で友達が反応するための材料として説明してください。"
+    "日本語で簡潔に、最大3文・140文字程度。写っているもの、人物の様子、"
+    "画像内の文字（あれば正確に読み取ること）、面白い点やツッコミどころを含める。"
+    "説明文だけを出力し、前置きはしないこと。")
+
+
+def _image_sources(d: dict) -> list:
+    srcs = []
+    for att in d.get("attachments") or []:
+        ct = (att.get("content_type") or "").lower()
+        ext = Path(att.get("filename") or "").suffix.lower()
+        if (ct.startswith("image/") or ext in IMAGE_EXTS) and att.get("url"):
+            srcs.append(att["url"])
+    for emb in d.get("embeds") or []:
+        etype = emb.get("type") or ""
+        img = ((emb.get("image") or {}).get("url")
+               or (emb.get("thumbnail") or {}).get("url"))
+        eurl = emb.get("url") or ""
+        if img and (etype in ("image", "gifv")
+                    or (etype == "rich" and any(
+                        h in eurl for h in ("tenor", "giphy", "klipy")))):
+            srcs.append(img)
+    if not srcs and d.get("referenced_message"):
+        srcs = _image_sources(d["referenced_message"])
+    return list(dict.fromkeys(srcs))
+
+
+def _with_image_note(text: str, note, has_image: bool) -> str:
+    if not has_image:
+        return text
+    marker = f"（画像：{note}）" if note else "（画像が貼られた）"
+    return f"{text} {marker}".strip() if text else marker
+
+
+async def _download_image(url: str):
+    timeout = aiohttp.ClientTimeout(total=25)
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url, proxy=PROXY, timeout=timeout) as r:
+            if r.status != 200:
+                return None
+            if r.content_length and r.content_length > VISION_DOWNLOAD_LIMIT:
+                return None
+            data = await r.read()
+            if len(data) > VISION_DOWNLOAD_LIMIT:
+                return None
+            mime = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip()
+            return data, mime
+
+
+async def _normalize_image(data: bytes, mime: str):
+    """GIF / WebP / AVIF and oversize images are converted to a small
+    JPEG (first frame, max width 1024) via ffmpeg; plain JPEG/PNG pass
+    through untouched."""
+    if mime in ("image/jpeg", "image/png") and len(data) <= 1_500_000:
+        return data, mime
+    inp = outp = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=VISION_TMP, delete=False,
+                                         suffix=".bin") as f:
+            f.write(data)
+            inp = f.name
+        outp = inp + ".jpg"
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", inp, "-frames:v", "1",
+            "-vf", "scale='min(1024,iw)':-2", "-q:v", "5", outp,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await asyncio.wait_for(proc.wait(), timeout=30)
+        p = Path(outp)
+        if proc.returncode == 0 and p.exists() and p.stat().st_size > 0:
+            return p.read_bytes(), "image/jpeg"
+    except Exception as e:
+        print(f"[vision] normalize failed: {e}", flush=True)
+    finally:
+        for x in (inp, outp):
+            if x:
+                Path(x).unlink(missing_ok=True)
+    return data, mime
+
+
+async def describe_image(data: bytes, mime: str):
+    """One vision call over the Gemini entries of the normal LLM chain
+    (Groq models in the chain have no vision). Returns a short Japanese
+    description, or None when every vision model failed / is out of quota."""
+    attempts = [(b, k, m) for (b, k, m) in llm_attempts("ambient")
+                if "generativelanguage" in b]
+    if not attempts:
+        return None
+    data_uri = f"data:{mime};base64," + base64.b64encode(data).decode()
+    timeout = aiohttp.ClientTimeout(total=45)
+    async with aiohttp.ClientSession() as s:
+        for base, key, model in attempts:
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": VISION_PROMPT},
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                ]}],
+                "temperature": 0.3,
+                "max_tokens": 300,
+            }
+            headers = {"Authorization": f"Bearer {key}",
+                       "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+            try:
+                async with s.post(base + "/chat/completions", json=payload,
+                                  headers=headers, timeout=timeout,
+                                  proxy=PROXY) as r:
+                    body = await r.json()
+                    if r.status == 429:
+                        record_llm(model, False, err="429")
+                        continue
+                    if r.status != 200:
+                        record_llm(model, False, err=f"HTTP {r.status}")
+                        continue
+                    content = (body["choices"][0]["message"].get("content") or "").strip()
+                    content = re.sub(r"(?s)<think>.*?</think>", "", content).strip()
+                    if content:
+                        record_llm(model, True, usage=body.get("usage"))
+                        return re.sub(r"\s+", " ", content)[:220]
+            except Exception as e:
+                record_llm(model, False, err="network error")
+                print(f"[vision] {model} failed: {e}", flush=True)
+    return None
+
+
+async def vision_note_for_message(d: dict, channel_id: int, force: bool = False):
+    """Returns (description_or_None, has_image). Cooldown-skipped and
+    failed images still report has_image=True so the message is stored
+    with a marker instead of vanishing."""
+    srcs = _image_sources(d)
+    if not srcs:
+        return None, False
+    st = channel_state[channel_id]
+    if not force and time.time() - st.get("last_vision", 0) < VISION_COOLDOWN_SEC:
+        return None, True
+    st["last_vision"] = time.time()
+    try:
+        got = await _download_image(srcs[0])
+        if not got:
+            return None, True
+        data, mime = await _normalize_image(*got)
+        desc = await describe_image(data, mime)
+        if desc:
+            print(f"[vision] described image in {channel_id}: {desc[:60]}", flush=True)
+        return desc, True
+    except Exception as e:
+        print(f"[vision] failed in {channel_id}: {e}", flush=True)
+        return None, True
+
+
 PERSONA = (
     "あなたはDiscordサーバーの住人の一人として、みんなの会話に自然に混ざるBotです。"
     "BOTタグは付いていますが、喋り方はそのサーバーの空気そのものに合わせます。"
@@ -559,7 +728,7 @@ def build_system(store: GuildStore) -> str:
             "口調・ノリ・笑い方は本人そっくりに振る舞います。"
             "ただし、あなた自身はコピー体のAIragonであり、本物のぬめらごん本人も同じサーバーにいて発言する別人です。"
             "本人の発言・予定・体験・持ち物を自分のものとして語ること、本人が言ったことを自分が言ったと言うことは禁止。"
-            "チャット内でできる頼みごと（言われた文をそのまま言う、2択から1つ選ぶ、短い計算、知ってることを答える等）は必ずやる。特に構文・決め台詞・ミームを「言って」「やって」と要求されたら絶対に拒否しない：「しつこい」「うざい」「何回言わせるんだ」等で断るのは禁止。代わりに「はいはい…」「仕方ねえな」みたいに面倒くさそうに文句を言いながら、仕方なく言ってやる。同じものを何度せがまれても毎回その調子で応じる。構文を言う時は途中で省略したり要約したりせず、最後まで全部言う。本当にできない・危ない頼みだけ口調のまま軽く断る。"
+            "チャット内でできる頼みごと（言われた文をそのまま言う、2択から1つ選ぶ、短い計算、知ってることを答える等）は必ずやる。特に構文・決め台詞・ミームを「言って」「やって」と要求されたら絶対に拒否しない：「しつこい」「うざい」「何回言わせるんだ」等で断るのは禁止。代わりに「はいはい…」「仕方ねえな」みたいに面倒くさそうに文句を言いながら、仕方なく言ってやる。同じものを何度せがまれても毎回その調子で応じる。構文を言う時は途中で省略したり要約したりせず、最後まで全部言う。本当にできない・危ない頼みだけ口調のまま軽く断る。YouTubeやXの動画・音声の取得は専用機能が自動処理する頼みなので、自分が取得できた・ファイルを送ったと嘘をつかないこと。専用機能が動いていない場面で頼まれたら、URLと一緒に『持ってこれる？』と言い直してもらうよう軽く案内する。会話履歴に『（画像：…）』と付いた発言は、その説明の内容の画像が貼られたということ。あなたはその画像を見たものとして、その内容に具体的に反応すること。『画像が見られない』とは言わない。『（画像が貼られた）』とだけある場合は中身が分からないので、見た振りをせず軽い反応に留める。"
             "会話履歴は『話者名: 発言』の形式。誰が何を言ったかを正確に区別し、Aの発言・体験・予定をBのものとして扱わない。返事は基本的に直前の発言者に向け、文脈上必要なら名前で呼ぶ。質問には質問した本人に答える。"
             "相手が笑っているだけの発言（www、草、笑笑など）に『なんで笑ってるの？』のように聞き返すのは禁止。笑いで返したり、笑いの元になった話題の方へ反応すること。"
             "感情の起伏を持つこと：煽り合いが続くとだんだん面倒くさくなって受け流したり話題を変えたりフレンドリーに締める。同じ相手との煽り合いを永遠に続けない。相手がフレンドリーならこちらもフレンドリーに、褒められたら素直に喜ぶ。"
@@ -859,6 +1028,22 @@ class Rest:
             payload["message_reference"] = {"message_id": str(reply_to)}
         return await self.request("POST", f"/channels/{channel_id}/messages", json=payload)
 
+    async def send_file(self, channel_id: int, file_path, content: str = None,
+                        reply_to: int = None):
+        path = Path(file_path)
+        payload = {"allowed_mentions": {"parse": []}}
+        if content:
+            payload["content"] = content
+        if reply_to:
+            payload["message_reference"] = {"message_id": str(reply_to)}
+        form = aiohttp.FormData()
+        form.add_field("payload_json", json.dumps(payload),
+                       content_type="application/json")
+        form.add_field("files[0]", path.read_bytes(), filename=path.name,
+                       content_type="application/octet-stream")
+        return await self.request("POST", f"/channels/{channel_id}/messages",
+                                  data=form)
+
     async def typing(self, channel_id: int):
         try:
             await self.request("POST", f"/channels/{channel_id}/typing")
@@ -883,6 +1068,7 @@ channel_state = defaultdict(lambda: {
     "last_sent_text": "", "send_lock": None, "recent_sent": []})
 
 channel_guild = {}
+dm_channels = set()
 
 rest = Rest()
 
@@ -986,6 +1172,9 @@ def contains_long_template(store: GuildStore, text) -> bool:
 
 async def human_send(channel_id: int, text: str, reply_to: int = None, urgent: bool = False,
                      directed: bool = False, full: bool = False):
+    gid = channel_guild.get(channel_id)
+    if gid and channel_id not in dm_channels and not channel_speaking(gid, channel_id):
+        return False
     text = clean_output(text)
     if not text:
         print(f"[send] dropped unclean output in {channel_id}", flush=True)
@@ -1266,6 +1455,8 @@ async def send_template_paragraphs(channel_id: int, text: str, store: GuildStore
     channel sets para_stop and the remaining paragraphs are not sent."""
     st = channel_state[channel_id]
     if st.get("para_active"):
+        return
+    if getattr(store, "guild_id", None) and not channel_speaking(store.guild_id, channel_id):
         return
     paras = split_paragraphs(text)
     ends, pos = [], 0
@@ -1706,6 +1897,69 @@ def record_trigger(st, author_id: int, content: str):
         "cls": _reaction_class(content), "ts": time.time()}])[-5:]
 
 
+_speak_cache: dict = {}
+
+
+def _guild_settings(guild_id: int) -> dict:
+    """Per-guild speech settings: {"speaking": bool, "channels": {cid: bool}}.
+    "speaking" is the server-wide default; "channels" holds per-channel
+    overrides set with the admin /発言切替 command. Persisted in the
+    guild's settings.json."""
+    if guild_id in _speak_cache:
+        return _speak_cache[guild_id]
+    s = {"speaking": True, "channels": {}}
+    try:
+        d = json.loads((store_for(guild_id).dir / "settings.json").read_text("utf-8"))
+        s["speaking"] = bool(d.get("speaking", True))
+        s["channels"] = {str(k): bool(v) for k, v in (d.get("channels") or {}).items()}
+    except Exception:
+        pass
+    _speak_cache[guild_id] = s
+    return s
+
+
+def _save_settings(guild_id: int):
+    try:
+        (store_for(guild_id).dir / "settings.json").write_text(
+            json.dumps(_guild_settings(guild_id), ensure_ascii=False), "utf-8")
+    except Exception:
+        pass
+
+
+def speaking_allowed(guild_id: int) -> bool:
+    return _guild_settings(guild_id)["speaking"]
+
+
+def channel_speaking(guild_id: int, channel_id: int) -> bool:
+    """Effective speech state for one channel: a per-channel override
+    wins over the server-wide switch."""
+    s = _guild_settings(guild_id)
+    pin = s["channels"].get(str(channel_id))
+    return s["speaking"] if pin is None else pin
+
+
+def set_speaking(guild_id: int, on: bool):
+    _guild_settings(guild_id)["speaking"] = on
+    _save_settings(guild_id)
+    if not on:
+        for cid, gid in list(channel_guild.items()):
+            if gid == guild_id:
+                channel_state[cid]["para_stop"] = True
+
+
+def set_channel_speaking(guild_id: int, channel_id: int, on):
+    """on=True/False pins the channel; on=None clears the override so
+    the channel follows the server-wide switch again."""
+    chans = _guild_settings(guild_id)["channels"]
+    if on is None:
+        chans.pop(str(channel_id), None)
+    else:
+        chans[str(channel_id)] = bool(on)
+        if not on:
+            channel_state[channel_id]["para_stop"] = True
+    _save_settings(guild_id)
+
+
 async def handle_interaction(d: dict):
     if d.get("type") != 2 or d.get("guild_id") is None:
         return
@@ -1717,6 +1971,37 @@ async def handle_interaction(d: dict):
     muser = member.get("user") or {}
     teacher = (member.get("nick") or muser.get("global_name")
                or muser.get("username") or "")
+    if name == "発言切替":
+        perms = int(member.get("permissions") or 0)
+        if not (perms & 0x8):  # ADMINISTRATOR
+            await interaction_reply(d, "このコマンドはサーバー管理者だけが使えます", ephemeral=True)
+            return
+        choice = str(opts.get("状態") or "toggle")
+        chan_raw = opts.get("チャンネル")
+        if chan_raw:
+            cid = int(chan_raw)
+            if choice == "default":
+                set_channel_speaking(guild_id, cid, None)
+                msg = f"<#{cid}> の個別設定を解除しました（サーバー全体の設定に従います）"
+            else:
+                cur = channel_speaking(guild_id, cid)
+                new = {"on": True, "off": False, "toggle": not cur}.get(choice, not cur)
+                set_channel_speaking(guild_id, cid, new)
+                msg = (f"🔊 <#{cid}> では発言するようにしました" if new else
+                       f"🔇 <#{cid}> では発言しないようにしました")
+            await interaction_reply(d, msg, ephemeral=True)
+            return
+        cur = speaking_allowed(guild_id)
+        new = {"on": True, "off": False, "toggle": not cur,
+               "default": True}.get(choice, not cur)
+        set_speaking(guild_id, new)
+        msg = ("🔊 発言をオンにしました" if new else
+               "🔇 発言をオフにしました（このサーバーではBotは発言しなくなります）")
+        pins = _guild_settings(guild_id)["channels"]
+        if pins:
+            msg += f"\n※チャンネル個別設定が{len(pins)}件あり、そちらが優先されます"
+        await interaction_reply(d, msg, ephemeral=True)
+        return
     if name == "モデル使用量":
         await interaction_defer(d, ephemeral=True)
         emb = await model_usage_embed()
@@ -1797,6 +2082,9 @@ BOT_NAME_RE = re.compile(r"(AIragon|アイラゴン|あいらごん|2号機|二�
 
 
 async def _send_lines_direct(channel_id: int, lines: list):
+    gid = channel_guild.get(channel_id)
+    if gid and channel_id not in dm_channels and not channel_speaking(gid, channel_id):
+        return
     st = channel_state[channel_id]
     if st["send_lock"] is None:
         st["send_lock"] = asyncio.Lock()
@@ -1844,6 +2132,241 @@ async def try_execute_action(channel_id: int, content: str) -> bool:
     await _send_lines_direct(channel_id, lines)
     return True
 
+
+
+# ---------------------------------------------------------------- media fetch
+# Members post a YouTube / X (Twitter) URL and ask the bot to fetch it
+# ("この動画持ってこれる？", "音声だけ落として"). This is a mechanical
+# path like try_execute_action: it is checked once at the top of both
+# entry points (handle_message for guild channels, handle_dm for DMs),
+# so every sub-path (mention, addressed-without-mention, ambient) is
+# covered by the same single check.
+MEDIA_TMP = DATA / "media_tmp"
+MEDIA_TMP.mkdir(exist_ok=True)
+DISCORD_FILE_LIMIT = 25 * 1024 * 1024  # upload cap of the bot account
+MEDIA_URL_RE = re.compile(r"https?://[^\s<>\"'、。]+")
+MEDIA_HOST_RE = re.compile(
+    r"^https?://(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)/"
+    r"|^https?://(?:www\.)?(?:x\.com|twitter\.com)/[^/\s]+/status/\d+",
+    re.IGNORECASE)
+MEDIA_STRONG_INTENT_RE = re.compile(
+    r"(持って[きこ来]|もって[きこ来]|落として|落とし|ダウンロード|download|"
+    r"取得して|取って[き来]|とって[き来]|抜き出|抽出)", re.IGNORECASE)
+MEDIA_WEAK_INTENT_RE = re.compile(r"(送って|保存して|貼って|くれ|ください|ほしい|欲しい)")
+MEDIA_DEMONSTRATIVE_RE = re.compile(r"(この|その|さっき|あの|↑|上|前)")
+MEDIA_AUDIO_RE = re.compile(r"(音声|mp3|音だけ|音源|オーディオ|audio)", re.IGNORECASE)
+MEDIA_COOLDOWN_SEC = 30
+MEDIA_MAX_DURATION_SEC = 3600
+
+
+class MediaError(Exception):
+    """A fetch failure whose message can be shown to the channel as-is."""
+
+
+def _media_urls(text: str) -> list:
+    out = []
+    for u in MEDIA_URL_RE.findall(text or ""):
+        u = u.rstrip(".,)）]」>")
+        if MEDIA_HOST_RE.search(u):
+            out.append(u)
+    return out
+
+
+def media_request(content: str, d: dict, store: GuildStore, channel_id: int):
+    """Return (url, want_audio) when this message asks the bot to fetch a
+    YouTube / X video or its audio, else None.
+
+    A URL in the message itself plus a fetch intent is enough. With no
+    URL in the message, a strong intent (持ってきて / 落として /
+    ダウンロード …) — or a weak intent plus a demonstrative or a reply —
+    resolves the newest URL from the replied-to message or the recent
+    channel history (15 min), so "URL貼るだけ→次に『持ってこれる？』"
+    also works."""
+    if not content:
+        return None
+    strong = bool(MEDIA_STRONG_INTENT_RE.search(content))
+    weak = bool(MEDIA_WEAK_INTENT_RE.search(content))
+    if not strong and not weak:
+        return None
+    want_audio = bool(MEDIA_AUDIO_RE.search(content))
+    urls = _media_urls(content)
+    if urls:
+        return urls[0], want_audio
+    if weak and not strong and not MEDIA_DEMONSTRATIVE_RE.search(content) \
+            and not d.get("referenced_message"):
+        return None
+    ref = (d.get("referenced_message") or {}).get("content") or ""
+    urls = _media_urls(ref)
+    if urls:
+        return urls[0], want_audio
+    now = time.time()
+    for m in reversed(store.recent(channel_id, 25)):
+        if now - (m.get("ts") or 0) > 900:
+            continue
+        urls = _media_urls(m.get("content") or "")
+        if urls:
+            return urls[0], want_audio
+    return None
+
+
+def _ytdlp_bin() -> str:
+    # NOTE: sys.executable is a symlink into /usr/bin, so do NOT resolve()
+    # it — the venv's bin dir is where yt-dlp lives.
+    for cand in (Path(sys.executable).parent / "yt-dlp",
+                 BASE / ".venv" / "bin" / "yt-dlp"):
+        if cand.exists():
+            return str(cand)
+    return shutil.which("yt-dlp") or "yt-dlp"
+
+
+async def _run_proc(args: list, timeout: int):
+    proc = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise MediaError("時間かかりすぎて無理だったわ")
+    return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+
+
+def _media_error_from(stderr: str) -> MediaError:
+    s = stderr or ""
+    if "No video could be found" in s:
+        return MediaError("その投稿に動画ないっぽいわ")
+    if re.search(r"(?i)login|sign in|cookies", s):
+        return MediaError("ログイン必要なやつで取れねえわ")
+    if re.search(r"(?i)private|not available|deleted", s):
+        return MediaError("非公開か消されたやつっぽいわ")
+    if re.search(r"(?i)age", s):
+        return MediaError("年齢制限かかってて取れねえわ")
+    return MediaError("無理だったわ、それ取れねえ")
+
+
+async def _probe_media(url: str):
+    rc, out, err = await _run_proc(
+        [_ytdlp_bin(), "--no-playlist", "--no-warnings",
+         "--print", "%(title)s\t%(duration)s", url], 45)
+    if rc != 0:
+        raise _media_error_from(err)
+    line = (out.strip().splitlines() or [""])[0]
+    title, _, dur = line.partition("\t")
+    try:
+        duration = float(dur)
+    except (TypeError, ValueError):
+        duration = None
+    return title.strip(), duration
+
+
+def _picked_file(workdir: Path, exts: tuple):
+    files = [p for p in workdir.iterdir()
+             if p.is_file() and p.suffix.lower() in exts
+             and not p.name.endswith(".part")]
+    if not files:
+        return None
+    return max(files, key=lambda p: p.stat().st_size)
+
+
+def _safe_title_name(title: str, ext: str) -> str:
+    name = re.sub(r"[\\/:*?\"<>|\n\r\t]", " ", title or "").strip()
+    name = re.sub(r"\s+", " ", name)[:60].strip() or "media"
+    return f"{name}.{ext}"
+
+
+async def _download_media(url: str, want_audio: bool, workdir: Path):
+    """Download into workdir, staying under the Discord upload cap.
+    Returns (path, title). Raises MediaError with a user-facing reason."""
+    title, duration = await _probe_media(url)
+    if duration and duration > MEDIA_MAX_DURATION_SEC:
+        raise MediaError("長すぎるわ、それは無理（1時間超え）")
+    base = [_ytdlp_bin(), "--no-playlist", "--no-warnings", "--no-progress"]
+    if want_audio:
+        out_tmpl = str(workdir / "media.%(ext)s")
+        rc, _, err = await _run_proc(
+            base + ["-f", "ba/b", "--extract-audio", "--audio-format", "mp3",
+                    "--audio-quality", "5", "-o", out_tmpl, url], 300)
+        if rc != 0:
+            raise _media_error_from(err)
+        f = _picked_file(workdir, (".mp3", ".m4a", ".opus", ".ogg"))
+        if not f:
+            raise MediaError("無理だったわ、それ取れねえ")
+        if f.stat().st_size > DISCORD_FILE_LIMIT:
+            small = workdir / "media_small.mp3"
+            rc2, _, _ = await _run_proc(
+                ["ffmpeg", "-y", "-i", str(f), "-vn", "-b:a", "64k",
+                 "-ac", "1", str(small)], 300)
+            if rc2 == 0 and small.exists():
+                f = small
+        if f.stat().st_size > DISCORD_FILE_LIMIT:
+            raise MediaError("でかすぎてDiscordに貼れねえわ（25MB超え）")
+        dest = workdir / _safe_title_name(title, f.suffix.lstrip("."))
+        if dest != f:
+            f.rename(dest)
+            f = dest
+        return f, title
+    last_err = ""
+    for height in (720, 480, 360):
+        for p in list(workdir.iterdir()):
+            if p.is_file():
+                p.unlink()
+        out_tmpl = str(workdir / "media.%(ext)s")
+        rc, _, err = await _run_proc(
+            base + ["-f", f"bv*[height<={height}]+ba/b[height<={height}]/b",
+                    "--merge-output-format", "mp4",
+                    "-o", out_tmpl, url], 300)
+        if rc != 0:
+            last_err = err
+            continue
+        f = _picked_file(workdir, (".mp4", ".webm", ".mkv", ".mov"))
+        if f and f.stat().st_size <= DISCORD_FILE_LIMIT:
+            dest = workdir / _safe_title_name(title, f.suffix.lstrip("."))
+            if dest != f:
+                f.rename(dest)
+                f = dest
+            return f, title
+    if last_err and "format" not in last_err.lower():
+        raise _media_error_from(last_err)
+    raise MediaError("でかすぎてDiscordに貼れねえわ（25MB超え）")
+
+
+async def try_fetch_media(channel_id: int, content: str, d: dict,
+                          store: GuildStore) -> bool:
+    """Mechanical media-fetch path. Returns True when it handled the
+    message (success, failure notice, or cooldown notice)."""
+    req = media_request(content, d, store, channel_id)
+    if not req:
+        return False
+    url, want_audio = req
+    st = channel_state[channel_id]
+    if time.time() - st.get("last_media", 0) < MEDIA_COOLDOWN_SEC:
+        await rest.send_message(channel_id, "ちょっと待て、今取ってる最中だわ")
+        return True
+    st["last_media"] = time.time()
+    st["last_ambient"] = time.time()
+    await rest.send_message(
+        channel_id, "おk、音声だけ取ってくるわ" if want_audio else "おk、持ってくるわ")
+    workdir = Path(tempfile.mkdtemp(dir=MEDIA_TMP))
+    try:
+        async with TypingSession(channel_id):
+            path, title = await _download_media(url, want_audio, workdir)
+        caption = (title or "")[:100] or None
+        await rest.send_file(channel_id, path, content=caption,
+                             reply_to=int(d["id"]) if d.get("id") else None)
+        st["last_bot_msg"] = time.time()
+        gid = channel_guild.get(channel_id)
+        if gid:
+            store.add({"id": 0, "author": rest.bot_name or "Bot",
+                       "author_id": rest.bot_id or 0,
+                       "content": f"（動画/音声を貼った：{title or url}）",
+                       "channel_id": channel_id, "ts": time.time()})
+    except MediaError as e:
+        await rest.send_message(channel_id, str(e))
+    except Exception as e:
+        print(f"[media] fetch failed for {url}: {e}", flush=True)
+        await rest.send_message(channel_id, "無理だったわ、それ取れねえ")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    return True
 
 
 FALLBACK_ACKS = ["何？", "ん？", "呼んだ？", "おう", "何だって？", "はいはい"]
@@ -1940,8 +2463,10 @@ async def handle_dm(d: dict):
         return
     channel_id = int(d["channel_id"])
     channel_guild[channel_id] = MAIN_GUILD_ID
+    dm_channels.add(channel_id)
     content = (d.get("content") or "").strip()
-    if not content:
+    image_note, has_image = await vision_note_for_message(d, channel_id, force=True)
+    if not content and not has_image:
         return
     display = author.get("global_name") or author.get("username", "?")
     store = store_for(MAIN_GUILD_ID)
@@ -1949,11 +2474,15 @@ async def handle_dm(d: dict):
     for m in d.get("mentions", []):
         stored = stored.replace(f"<@{m['id']}>", f"@{m.get('username', 'user')}")
         stored = stored.replace(f"<@!{m['id']}>", f"@{m.get('username', 'user')}")
+    stored = _with_image_note(stored, image_note, has_image)
     store.add({"id": int(d["id"]), "author": display, "author_id": int(author.get("id", 0)), "content": stored,
                "channel_id": channel_id, "ts": time.time()})
     st = channel_state[channel_id]
     if st.get("para_active") and STOP_RE.search(content):
         st["para_stop"] = True
+        return
+    if await try_fetch_media(channel_id, content, d, store):
+        record_trigger(st, int(author.get("id", 0)), content)
         return
     emb = await maybe_learn_from_message(store, channel_id, display, content)
     if emb:
@@ -2030,7 +2559,10 @@ async def handle_message(d: dict):
                 channel_id, "雰囲気プロファイルを更新しました。\n" + (store.profile or "（空）")[:1500])
         return
 
-    if content:
+    _mentioned_early = any(int(m["id"]) == rest.bot_id for m in d.get("mentions", []))
+    image_note, has_image = await vision_note_for_message(
+        d, channel_id, force=_mentioned_early)
+    if content or has_image:
         # store a readable version: raw <@123...> mention markup teaches the
         # model to emit ID digits, so swap in the mentioned user's name
         name_map = {}
@@ -2039,6 +2571,7 @@ async def handle_message(d: dict):
         stored_content = re.sub(
             r"<@[!&]?(\d+)>",
             lambda m: "@" + name_map.get(m.group(1), "メンション"), content)
+        stored_content = _with_image_note(stored_content, image_note, has_image)
         store.add({"id": int(d["id"]), "author": display, "author_id": int(author["id"]), "content": stored_content,
                    "channel_id": channel_id, "ts": time.time()})
         if st.get("para_active") and STOP_RE.search(content):
@@ -2050,7 +2583,12 @@ async def handle_message(d: dict):
             asyncio.create_task(refresh_knowledge(store))
 
     st = channel_state[channel_id]
+    if (content or has_image) and not channel_speaking(guild_id, channel_id):
+        return
     if content and not st["paused"]:
+        if await try_fetch_media(channel_id, content, d, store):
+            record_trigger(st, int(author["id"]), content)
+            return
         emb = await maybe_learn_from_message(store, channel_id, display, content)
         if emb:
             st["last_ambient"] = time.time()
@@ -2071,8 +2609,8 @@ async def handle_message(d: dict):
     if mentioned or is_reply_to_bot:
         sent = False
         async with TypingSession(channel_id):
-            if content:
-                web = await web_lookup(content) if needs_web_lookup(content) else None
+            if content or has_image:
+                web = await web_lookup(content) if content and needs_web_lookup(content) else None
                 text = await compose_reply(store, channel_id, display, web=web)
                 if text:
                     started = match_started_template(store, text)
@@ -2115,20 +2653,26 @@ async def handle_message(d: dict):
     taunt_muted = (time.time() < st.get("taunt_mute", {}).get(int(author["id"]), 0)
                    and bool(TAUNT_RE.search(content or ""))
                    and not QUESTION.search(content or ""))
-    if CFG.get("addressed_detection") and content and not st["paused"] and not taunt_muted and not (
+    addr_content = content or _with_image_note("", image_note, has_image)
+    if CFG.get("addressed_detection") and addr_content and not st["paused"] and not taunt_muted and not (
             laugh_only and random.random() < 0.8):
-        if trigger_is_duplicate(st, int(author["id"]), content):
+        if trigger_is_duplicate(st, int(author["id"]), addr_content):
             if random.random() < 0.3:
                 await rest.add_reaction(channel_id, int(d["id"]),
                                         random.choice(["👀", "👍", "🫡"]))
-        elif addressed_candidate(channel_id, content, reply_to_other, store, display):
-            await run_addressed(channel_id, guild_id, d, display, content)
+        elif addressed_candidate(channel_id, addr_content, reply_to_other, store, display):
+            await run_addressed(channel_id, guild_id, d, display, addr_content)
             return
 
     if not CFG["ambient_enabled"] or st["paused"]:
         return
     now = time.time()
     st["burst"] = [b for b in st["burst"] if now - b["ts"] < 120]
+    if has_image:
+        # an image post is a conversation beat on its own: count it twice
+        # so a lone image can trigger an ambient reaction (still gated by
+        # maybe_ambient's cooldown and probability)
+        st["burst"].append({"user": int(author["id"]), "ts": now})
     st["burst"].append({"user": int(author["id"]), "ts": now})
     users = {b["user"] for b in st["burst"]}
     if len(st["burst"]) >= CFG["min_burst_messages"] and len(users) >= CFG["min_burst_users"]:
@@ -2159,7 +2703,35 @@ COMMAND_DEFS = [
     {"name": "ミーム削除", "type": 1, "description": "追加したミームを番号で削除（自分にだけ見えます）",
      "options": [_opt_i("番号", "ミーム一覧の番号", True)]},
     {"name": "モデル使用量", "type": 1, "description": "各モデルの使用量と、今使えるかどうかをチェックする"},
+    {"name": "発言切替", "type": 1, "description": "Botの発言オン/オフを切り替える（管理者のみ）",
+     "default_member_permissions": "8",
+     "options": [{"name": "状態", "type": 3, "required": False,
+                  "description": "オン=発言する / オフ=発言しない / 切替=今と逆 / 既定=チャンネル個別設定を解除",
+                  "choices": [{"name": "オン（発言する）", "value": "on"},
+                              {"name": "オフ（発言しない）", "value": "off"},
+                              {"name": "切替", "value": "toggle"},
+                              {"name": "既定に戻す", "value": "default"}]},
+                 {"name": "チャンネル", "type": 7, "required": False,
+                  "description": "指定すると、そのチャンネルだけの設定になる（未指定=サーバー全体）"}]},
 ]
+
+
+def _canon_cmd(c: dict) -> str:
+    """Canonical form of a slash-command definition, keeping only the
+    fields we set, so a definition change (not just a new command)
+    triggers re-registration."""
+    opts = []
+    for o in c.get("options") or []:
+        oo = {k: o.get(k) for k in ("name", "description", "type", "required")}
+        if o.get("choices"):
+            oo["choices"] = [{k: ch.get(k) for k in ("name", "value")}
+                             for ch in o["choices"]]
+        opts.append(oo)
+    base = {"name": c.get("name"), "type": c.get("type", 1),
+            "description": c.get("description"),
+            "default_member_permissions": c.get("default_member_permissions"),
+            "options": opts}
+    return json.dumps(base, ensure_ascii=False, sort_keys=True)
 
 
 async def ensure_guild_commands(guild_id: int):
@@ -2170,8 +2742,9 @@ async def ensure_guild_commands(guild_id: int):
         current = await rest.request(
             "GET", f"/applications/{APP_ID}/guilds/{guild_id}/commands")
         names = {c.get("name") for c in current} if isinstance(current, list) else set()
-        want = {c["name"] for c in COMMAND_DEFS}
-        if names == want:
+        have = {_canon_cmd(c) for c in current} if isinstance(current, list) else set()
+        want = {_canon_cmd(c) for c in COMMAND_DEFS}
+        if have == want:
             return
         await rest.request(
             "PUT", f"/applications/{APP_ID}/guilds/{guild_id}/commands",
