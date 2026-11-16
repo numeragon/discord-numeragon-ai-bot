@@ -1,4 +1,5 @@
 {
+  "casino_web_url": "",
   "ambient_cooldown_sec": 25,
   "ambient_enabled": true,
   "ambient_pause_sec": [

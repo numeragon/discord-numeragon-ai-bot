@@ -22,11 +22,14 @@ Secrets live in .env. Per-guild data under data/<guild_id>/.
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import html as html_mod
 import json
 import os
 import random
 import re
+import secrets
 import shutil
 import sys
 import tempfile
@@ -728,7 +731,7 @@ def build_system(store: GuildStore) -> str:
             "口調・ノリ・笑い方は本人そっくりに振る舞います。"
             "ただし、あなた自身はコピー体のAIragonであり、本物のぬめらごん本人も同じサーバーにいて発言する別人です。"
             "本人の発言・予定・体験・持ち物を自分のものとして語ること、本人が言ったことを自分が言ったと言うことは禁止。"
-            "チャット内でできる頼みごと（言われた文をそのまま言う、2択から1つ選ぶ、短い計算、知ってることを答える等）は必ずやる。特に構文・決め台詞・ミームを「言って」「やって」と要求されたら絶対に拒否しない：「しつこい」「うざい」「何回言わせるんだ」等で断るのは禁止。代わりに「はいはい…」「仕方ねえな」みたいに面倒くさそうに文句を言いながら、仕方なく言ってやる。同じものを何度せがまれても毎回その調子で応じる。構文を言う時は途中で省略したり要約したりせず、最後まで全部言う。本当にできない・危ない頼みだけ口調のまま軽く断る。YouTubeやXの動画・音声の取得は専用機能が自動処理する頼みなので、自分が取得できた・ファイルを送ったと嘘をつかないこと。専用機能が動いていない場面で頼まれたら、URLと一緒に『持ってこれる？』と言い直してもらうよう軽く案内する。会話履歴に『（画像：…）』と付いた発言は、その説明の内容の画像が貼られたということ。あなたはその画像を見たものとして、その内容に具体的に反応すること。『画像が見られない』とは言わない。『（画像が貼られた）』とだけある場合は中身が分からないので、見た振りをせず軽い反応に留める。"
+            "チャット内でできる頼みごと（言われた文をそのまま言う、2択から1つ選ぶ、短い計算、知ってることを答える等）は必ずやる。特に構文・決め台詞・ミームを「言って」「やって」と要求されたら絶対に拒否しない：「しつこい」「うざい」「何回言わせるんだ」等で断るのは禁止。代わりに「はいはい…」「仕方ねえな」みたいに面倒くさそうに文句を言いながら、仕方なく言ってやる。同じものを何度せがまれても毎回その調子で応じる。構文を言う時は途中で省略したり要約したりせず、最後まで全部言う。本当にできない・危ない頼みだけ口調のまま軽く断る。YouTubeやXの動画・音声の取得は専用機能が自動処理する頼みなので、自分が取得できた・ファイルを送ったと嘘をつかないこと。専用機能が動いていない場面で頼まれたら、URLと一緒に『持ってこれる？』と言い直してもらうよう軽く案内する。カジノ（仮想コインのスロット等）も専用パネル機能が処理するので、自分がコインを増減させた・アイテムを渡したと嘘をつかないこと。遊びたい人には『カジノしたい』と言えば専用パネルが出ると軽く案内する。会話履歴に『（画像：…）』と付いた発言は、その説明の内容の画像が貼られたということ。あなたはその画像を見たものとして、その内容に具体的に反応すること。『画像が見られない』とは言わない。『（画像が貼られた）』とだけある場合は中身が分からないので、見た振りをせず軽い反応に留める。"
             "会話履歴は『話者名: 発言』の形式。誰が何を言ったかを正確に区別し、Aの発言・体験・予定をBのものとして扱わない。返事は基本的に直前の発言者に向け、文脈上必要なら名前で呼ぶ。質問には質問した本人に答える。"
             "相手が笑っているだけの発言（www、草、笑笑など）に『なんで笑ってるの？』のように聞き返すのは禁止。笑いで返したり、笑いの元になった話題の方へ反応すること。"
             "感情の起伏を持つこと：煽り合いが続くとだんだん面倒くさくなって受け流したり話題を変えたりフレンドリーに締める。同じ相手との煽り合いを永遠に続けない。相手がフレンドリーならこちらもフレンドリーに、褒められたら素直に喜ぶ。"
@@ -1018,12 +1021,14 @@ class Rest:
         return await self.request("GET", path)
 
     async def send_message(self, channel_id: int, content: str = None,
-                           reply_to: int = None, embeds=None):
+                           reply_to: int = None, embeds=None, components=None):
         payload = {"allowed_mentions": {"parse": []}}
         if content:
             payload["content"] = content
         if embeds:
             payload["embeds"] = embeds
+        if components:
+            payload["components"] = components
         if reply_to:
             payload["message_reference"] = {"message_id": str(reply_to)}
         return await self.request("POST", f"/channels/{channel_id}/messages", json=payload)
@@ -1692,8 +1697,23 @@ def teach_meme_delete(guild_id: int, n) -> dict:
     return {"message": f"消した：『{removed.get('term')}』", "embed": emb}
 
 
+async def interaction_callback(d: dict, cb_type: int, data: dict):
+    """Raw interaction callback (type 4 = new message, 7 = update the
+    message the component sits on). Used by the casino panel buttons."""
+    url = f"https://discord.com/api/v10/interactions/{d['id']}/{d['token']}/callback"
+    payload = {"type": cb_type, "data": data}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, json=payload, proxy=PROXY) as r:
+                if r.status >= 400:
+                    print(f"[interaction] callback {r.status}: "
+                          f"{(await r.text())[:150]}", flush=True)
+    except Exception as e:
+        print(f"[interaction] callback error: {e}", flush=True)
+
+
 async def interaction_reply(d: dict, content: str, embeds=None,
-                            ephemeral: bool = False):
+                            ephemeral: bool = False, components=None):
     url = f"https://discord.com/api/v10/interactions/{d['id']}/{d['token']}/callback"
     data = {"allowed_mentions": {"parse": []}}
     if ephemeral:
@@ -1702,6 +1722,8 @@ async def interaction_reply(d: dict, content: str, embeds=None,
         data["content"] = content[:1900]
     if embeds:
         data["embeds"] = embeds
+    if components:
+        data["components"] = components
     payload = {"type": 4, "data": data}
     try:
         async with aiohttp.ClientSession() as s:
@@ -1961,6 +1983,9 @@ def set_channel_speaking(guild_id: int, channel_id: int, on):
 
 
 async def handle_interaction(d: dict):
+    if d.get("type") == 3:  # message component (casino panel buttons)
+        await handle_casino_component(d)
+        return
     if d.get("type") != 2 or d.get("guild_id") is None:
         return
     guild_id = int(d["guild_id"])
@@ -2006,6 +2031,13 @@ async def handle_interaction(d: dict):
         await interaction_defer(d, ephemeral=True)
         emb = await model_usage_embed()
         await interaction_followup_edit(d, [emb])
+        return
+    if name == "カジノ":
+        uid = int(muser.get("id", 0) or 0)
+        casino_user(guild_id, uid, teacher)
+        await interaction_reply(
+            d, "", embeds=[casino_embed(guild_id, uid, teacher)],
+            components=casino_components("main", uid, CASINO_BETS[1]))
         return
     if name == "構文追加":
         res = teach_template_add(guild_id, str(opts.get("テンプレート") or ""),
@@ -2369,6 +2401,780 @@ async def try_fetch_media(channel_id: int, content: str, d: dict,
     return True
 
 
+# ---------------------------------------------------------------- casino
+# Virtual-coin casino with a dedicated button panel. Coins are free and
+# exist only inside the bot: they cannot be bought, cashed out,
+# transferred, or exchanged for anything with real-world value. Points
+# are earned by claiming the daily bonus and by chatting; the shop trades
+# them for in-bot collectible badges / titles shown on the casino
+# profile. Like the media fetch, this is a mechanical path checked once
+# at the top of both entry points (handle_message / handle_dm), and the
+# panel itself is driven by component interactions (type 3), which are
+# stateless except for blackjack: the owner id and the current bet are
+# encoded in every button's custom_id, so panels survive restarts.
+
+CASINO_START_BALANCE = 1000
+CASINO_DAILY_AMOUNT = 500
+CASINO_CHAT_REWARD = 2
+CASINO_CHAT_REWARD_COOLDOWN = 60
+CASINO_BETS = [10, 100, 500, 1000]
+CASINO_TRIGGER_RE = re.compile(
+    r"(カジノ|かじの|casino).{0,6}"
+    r"(したい|やりたい|やろう|やる|行きたい|行く|遊びたい|遊ぶ|開いて|"
+    r"ひらいて|オープン|open|始めたい|始める|入りたい)",
+    re.IGNORECASE)
+CASINO_EXACT_RE = re.compile(r"^(カジノ|かじの|casino)[！!。．\s]*$",
+                             re.IGNORECASE)
+
+CASINO_SHOP = [
+    {"id": "debut", "name": "バッジ「カジノデビュー」", "price": 100,
+     "desc": "最初の一歩。プロフィールに残る記念バッジ"},
+    {"id": "slot_mania", "name": "バッジ「スロットマニア」", "price": 800,
+     "desc": "スロット好きの証"},
+    {"id": "title_broke", "name": "称号「破産王」", "price": 2000,
+     "desc": "負けっぷりを誇る称号"},
+    {"id": "high_roller", "name": "バッジ「ハイローラー」", "price": 5000,
+     "desc": "大きく賭ける者のバッジ"},
+    {"id": "title_king", "name": "称号「カジノ王」", "price": 10000,
+     "desc": "このサーバーのカジノを制した者の称号"},
+    {"id": "title_rich", "name": "称号「ぬめ億万長者」", "price": 50000,
+     "desc": "最終目標。持ってたら相当すごい"},
+]
+CASINO_SHOP_BY_ID = {it["id"]: it for it in CASINO_SHOP}
+
+
+class CasinoError(Exception):
+    """A casino action failure whose message can be shown as-is."""
+
+
+def casino_wants(content: str) -> bool:
+    c = (content or "").strip()
+    if not c:
+        return False
+    if CASINO_EXACT_RE.match(c):
+        return True
+    return bool(CASINO_TRIGGER_RE.search(c))
+
+
+_casino_cache = {}
+
+
+def _casino_data(guild_id: int) -> dict:
+    if guild_id in _casino_cache:
+        return _casino_cache[guild_id]
+    data = {"users": {}}
+    try:
+        d = json.loads((guild_dir(guild_id) / "casino.json").read_text("utf-8"))
+        if isinstance(d.get("users"), dict):
+            data = d
+    except Exception:
+        pass
+    _casino_cache[guild_id] = data
+    return data
+
+
+def _casino_save(guild_id: int):
+    try:
+        (guild_dir(guild_id) / "casino.json").write_text(
+            json.dumps(_casino_data(guild_id), ensure_ascii=False), "utf-8")
+    except Exception:
+        pass
+
+
+def casino_user(guild_id: int, user_id: int, display: str = "") -> dict:
+    users = _casino_data(guild_id)["users"]
+    rec = users.get(str(user_id))
+    if rec is None:
+        rec = {"balance": CASINO_START_BALANCE, "name": display or "?",
+               "total_wagered": 0, "total_won": 0, "games": 0,
+               "daily": "", "last_chat_reward": 0.0, "items": []}
+        users[str(user_id)] = rec
+        _casino_save(guild_id)
+    elif display and rec.get("name") in ("", "?"):
+        rec["name"] = display
+    return rec
+
+
+def casino_claim_daily(guild_id: int, user_id: int):
+    rec = casino_user(guild_id, user_id)
+    today = _jst_today()
+    if rec.get("daily") == today:
+        return False, "デイリーはもう受け取ったわ。明日また来い"
+    rec["daily"] = today
+    rec["balance"] += CASINO_DAILY_AMOUNT
+    _casino_save(guild_id)
+    return True, f"デイリー +{CASINO_DAILY_AMOUNT} 2009コイン。残高 {rec['balance']:,}"
+
+
+def casino_chat_reward(guild_id: int, user_id: int) -> bool:
+    """Chatting earns a little: +2 coins, at most once a minute per user."""
+    rec = casino_user(guild_id, user_id)
+    now = time.time()
+    if now - float(rec.get("last_chat_reward") or 0) < CASINO_CHAT_REWARD_COOLDOWN:
+        return False
+    rec["last_chat_reward"] = now
+    rec["balance"] += CASINO_CHAT_REWARD
+    _casino_save(guild_id)
+    return True
+
+
+def casino_settle(guild_id: int, user_id: int, bet: int, payout: int) -> dict:
+    """Deduct bet and credit payout for one finished game."""
+    rec = casino_user(guild_id, user_id)
+    if bet <= 0:
+        raise CasinoError("賭け金がおかしいわ")
+    if rec["balance"] < bet:
+        raise CasinoError(
+            f"残高不足だわ（残高 {rec['balance']:,} / 賭け金 {bet:,}）。"
+            "デイリー受け取るか発言して貯めろ")
+    rec["balance"] += int(payout) - bet
+    rec["total_wagered"] += bet
+    rec["total_won"] += int(payout)
+    rec["games"] += 1
+    _casino_save(guild_id)
+    return rec
+
+
+CASINO_SESSION_TTL = 2 * 3600
+CASINO_SETTLE_RE = re.compile(r"NCSETTLE:([A-Za-z0-9_\-]+)\.([0-9a-f]{16})")
+CASINO_SETTLE_KEY = "nume-casino-settle-v1"
+
+
+def _casino_sessions(guild_id: int) -> dict:
+    return _casino_data(guild_id).setdefault("sessions", {})
+
+
+def casino_sweep_sessions(guild_id: int, user_id: int) -> int:
+    """Refund the locked coins of the user's expired web sessions."""
+    now = time.time()
+    refunded = 0
+    for sess in _casino_sessions(guild_id).values():
+        if (sess.get("user_id") == user_id and sess.get("state") == "active"
+                and now > float(sess.get("expires") or 0)):
+            sess["state"] = "expired"
+            rec = casino_user(guild_id, user_id)
+            rec["balance"] += int(sess.get("locked") or 0)
+            refunded += int(sess.get("locked") or 0)
+    if refunded:
+        _casino_save(guild_id)
+    return refunded
+
+
+def casino_issue_session(guild_id: int, user_id: int, display: str = ""):
+    """Move the user's whole balance into a web-casino session and
+    return (session, reused). The coins stay locked until the user
+    settles with the code the web page issues, or the session expires
+    (2h) and the sweep refunds them."""
+    casino_sweep_sessions(guild_id, user_id)
+    sessions = _casino_sessions(guild_id)
+    now = time.time()
+    for sess in sessions.values():
+        if sess.get("user_id") == user_id and sess.get("state") == "active":
+            return sess, True
+    rec = casino_user(guild_id, user_id, display)
+    locked = int(rec["balance"])
+    rec["balance"] = 0
+    sess = {"sid": secrets.token_urlsafe(18), "user_id": user_id,
+            "locked": locked, "issued": now,
+            "expires": now + CASINO_SESSION_TTL, "state": "active"}
+    sessions[sess["sid"]] = sess
+    _casino_save(guild_id)
+    return sess, False
+
+
+def _settle_sig(sid, final, wagered, won, games, items) -> str:
+    msg = (f"{sid}:{final}:{wagered}:{won}:{games}:"
+           f"{','.join(items)}:{CASINO_SETTLE_KEY}")
+    return hashlib.sha256(msg.encode("utf-8")).hexdigest()[:16]
+
+
+def casino_settle_session(guild_id: int, user_id: int, b64: str, sig: str):
+    """Verify and apply a settlement code from the web casino page.
+    Returns (ok, message). The arithmetic is fully rechecked here:
+    final must equal locked - wagered + won - shop cost."""
+    try:
+        raw = base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4))
+        payload = json.loads(raw.decode("utf-8"))
+        sid = str(payload["sid"])
+        final = int(payload["final"])
+        wagered = int(payload["wagered"])
+        won = int(payload["won"])
+        games = int(payload["games"])
+        entries = []
+        canon = []
+        for raw_item in payload.get("items") or []:
+            if isinstance(raw_item, dict):
+                iid = str(raw_item["id"])
+                cost = int(raw_item["cost"])
+                nm = str(raw_item.get("name") or "")[:60]
+                entries.append({"id": iid, "cost": cost, "name": nm})
+                canon.append(f"{iid}@{cost}")
+            else:
+                iid = str(raw_item)
+                entries.append({"id": iid, "cost": None, "name": ""})
+                canon.append(iid)
+        items = [e["id"] for e in entries]
+    except Exception:
+        return False, "精算コードの形式がおかしいわ"
+    if min(final, wagered, won, games) < 0 or len(set(items)) != len(items):
+        return False, "精算コードの内容がおかしいわ"
+    if not hmac.compare_digest(
+            _settle_sig(sid, final, wagered, won, games, canon), sig):
+        return False, "精算コードの署名が合わねえわ"
+    casino_sweep_sessions(guild_id, user_id)
+    sess = _casino_sessions(guild_id).get(sid)
+    if sess is None or sess.get("user_id") != user_id:
+        return False, "そのセッション見つからねえわ（自分のコードだけ使える）"
+    if sess.get("state") == "settled":
+        return False, "そのセッションはもう精算済みだわ"
+    if sess.get("state") != "active":
+        return False, "そのセッションは期限切れだわ。持ち込み分は残高に戻してある"
+    rec = casino_user(guild_id, user_id)
+    shop_cost = 0
+    for e in entries:
+        if e["id"] in rec.get("items", []):
+            return False, "ショップの内容がおかしいわ"
+        if e["cost"] is None:
+            item = CASINO_SHOP_BY_ID.get(e["id"])
+            if item is None:
+                return False, "ショップの内容がおかしいわ"
+            e["cost"] = item["price"]
+            e["name"] = item["name"]
+        elif e["cost"] <= 0:
+            return False, "ショップの内容がおかしいわ"
+        shop_cost += e["cost"]
+    expected = int(sess["locked"]) - wagered + won - shop_cost
+    if final != expected:
+        return False, "精算コードの計算が合わねえわ"
+    sess["state"] = "settled"
+    rec["balance"] += final
+    rec["total_wagered"] += wagered
+    rec["total_won"] += won
+    rec["games"] += games
+    rec.setdefault("items", []).extend(items)
+    names = rec.setdefault("item_names", {})
+    for e in entries:
+        if e["name"]:
+            names[e["id"]] = e["name"]
+    _casino_save(guild_id)
+    gained = "".join(f"\n・{e['name'] or e['id']} を手に入れた！"
+                     for e in entries)
+    return True, (f"精算したわ。Webカジノ {games} ゲーム、"
+                  f"{wagered:,} ベット → {final:,} 2009コイン持ち帰り。"
+                  f"残高 {rec['balance']:,}{gained}")
+
+
+async def try_casino_settle(channel_id: int, content: str, d: dict,
+                            store: GuildStore) -> bool:
+    """Mechanical path for web-casino settlement codes pasted in chat."""
+    m = CASINO_SETTLE_RE.search(content or "")
+    if not m:
+        return False
+    guild_id = channel_guild.get(channel_id) or MAIN_GUILD_ID
+    author = d.get("author", {})
+    ok, msg = casino_settle_session(guild_id, int(author["id"]),
+                                    m.group(1), m.group(2))
+    await rest.send_message(channel_id, msg,
+                            reply_to=int(d["id"]) if d.get("id") else None)
+    st = channel_state[channel_id]
+    st["last_bot_msg"] = time.time()
+    if store is not None:
+        store.add({"id": 0, "author": rest.bot_name or "Bot",
+                   "author_id": rest.bot_id or 0,
+                   "content": "（Webカジノの精算をした）",
+                   "channel_id": channel_id, "ts": time.time()})
+    return True
+
+
+def casino_buy(guild_id: int, user_id: int, item_id: str):
+    item = CASINO_SHOP_BY_ID.get(item_id)
+    if item is None:
+        return False, "そんな商品ねえわ"
+    rec = casino_user(guild_id, user_id)
+    if item_id in rec.get("items", []):
+        return False, f"{item['name']} はもう持ってるわ"
+    if rec["balance"] < item["price"]:
+        return False, (f"コイン足りねえ（残高 {rec['balance']:,} / "
+                       f"価格 {item['price']:,}）")
+    rec["balance"] -= item["price"]
+    rec.setdefault("items", []).append(item_id)
+    _casino_save(guild_id)
+    return True, f"{item['name']} を手に入れた！ 残高 {rec['balance']:,}"
+
+
+# ------------------------------------------------------------ game logic
+
+SLOT_SYMBOLS = ["🍒", "🍋", "🔔", "⭐", "💎", "🎰"]
+SLOT_WEIGHTS = [30, 26, 20, 12, 8, 4]
+SLOT_TRIPLE = {"🎰": 20, "💎": 10, "⭐": 7, "🔔": 5, "🍋": 4, "🍒": 3}
+
+
+def slot_spin(bet: int):
+    reels = random.choices(SLOT_SYMBOLS, weights=SLOT_WEIGHTS, k=3)
+    if reels[0] == reels[1] == reels[2]:
+        payout = bet * SLOT_TRIPLE[reels[0]]
+    elif reels[0] == reels[1] or reels[1] == reels[2] or reels[0] == reels[2]:
+        payout = int(bet * 1.5)
+    else:
+        payout = 0
+    return reels, payout
+
+
+def coin_flip(bet: int, choice: str):
+    flip = random.choice(["h", "t"])
+    payout = int(bet * 1.9) if flip == choice else 0
+    return flip, payout
+
+
+def dice_duel(bet: int):
+    me, bot = random.randint(1, 6), random.randint(1, 6)
+    if me > bot:
+        payout = int(bet * 1.9)
+    elif me == bot:
+        payout = bet  # tie: bet back
+    else:
+        payout = 0
+    return me, bot, payout
+
+
+BJ_RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+BJ_SUITS = ["♠", "♥", "♦", "♣"]
+
+
+def bj_new_deck() -> list:
+    deck = [f"{r}{s}" for s in BJ_SUITS for r in BJ_RANKS]
+    random.shuffle(deck)
+    return deck
+
+
+def bj_hand_value(cards: list) -> int:
+    total, aces = 0, 0
+    for c in cards:
+        r = c[:-1]
+        if r == "A":
+            total += 11
+            aces += 1
+        elif r in ("J", "Q", "K"):
+            total += 10
+        else:
+            total += int(r)
+    while total > 21 and aces:
+        total -= 10
+        aces -= 1
+    return total
+
+
+bj_sessions = {}  # panel message_id -> session dict (in-memory only)
+
+
+def bj_resolve(session: dict):
+    """Dealer plays out and the final payout is decided (bet already
+    deducted at start). Returns (payout, result_text)."""
+    bet = session["bet"]
+    deck, dealer = session["deck"], session["dealer"]
+    while bj_hand_value(dealer) < 17 and deck:
+        dealer.append(deck.pop())
+    pv, dv = bj_hand_value(session["player"]), bj_hand_value(dealer)
+    if pv > 21:
+        return 0, f"バースト… {pv} で負け。-{bet:,} 2009コイン"
+    if dv > 21:
+        return bet * 2, f"ディーラーがバースト（{dv}）！ 勝ち +{bet:,} 2009コイン"
+    if pv > dv:
+        return bet * 2, f"{pv} vs {dv} で勝ち！ +{bet:,} 2009コイン"
+    if pv < dv:
+        return 0, f"{pv} vs {dv} で負け。-{bet:,} 2009コイン"
+    return bet, f"{pv} vs {dv} で引き分け。賭け金は戻したわ"
+
+
+# ------------------------------------------------------------ panel UI
+
+def _casino_cid(action: str, uid: int, *args) -> str:
+    return ":".join(["casino", action, str(uid)] + [str(a) for a in args])
+
+
+def _casino_btn(custom_id: str, label: str, style: int = 1, emoji: str = None,
+                disabled: bool = False) -> dict:
+    b = {"type": 2, "custom_id": custom_id, "label": label, "style": style,
+         "disabled": disabled}
+    if emoji:
+        b["emoji"] = {"name": emoji}
+    return b
+
+
+def _casino_row(*buttons) -> dict:
+    return {"type": 1, "components": list(buttons)}
+
+
+def casino_components(view: str, uid: int, bet: int) -> list:
+    if view == "coin":
+        return [_casino_row(
+            _casino_btn(_casino_cid("coin", uid, bet, "h"), "表に賭ける", 1, "🪙"),
+            _casino_btn(_casino_cid("coin", uid, bet, "t"), "裏に賭ける", 1, "🪙"),
+            _casino_btn(_casino_cid("main", uid, bet), "戻る", 2))]
+    if view == "shop":
+        rows, row = [], []
+        for i, it in enumerate(CASINO_SHOP):
+            row.append(_casino_btn(_casino_cid("buy", uid, bet, it["id"]),
+                                   f"{i + 1}番を買う", 1, "🛒"))
+            if len(row) == 5:
+                rows.append(_casino_row(*row))
+                row = []
+        if row:
+            rows.append(_casino_row(*row))
+        rows.append(_casino_row(
+            _casino_btn(_casino_cid("main", uid, bet), "戻る", 2)))
+        return rows
+    if view == "ranking":
+        return [_casino_row(
+            _casino_btn(_casino_cid("main", uid, bet), "戻る", 2))]
+    if view == "bj":
+        return [_casino_row(
+            _casino_btn(_casino_cid("bj_hit", uid, bet), "ヒット", 1, "🃏"),
+            _casino_btn(_casino_cid("bj_stand", uid, bet), "スタンド", 3, "✋"),
+            _casino_btn(_casino_cid("close", uid, bet), "やめる（賭け金没収）", 4))]
+    nxt = CASINO_BETS[(CASINO_BETS.index(bet) + 1) % len(CASINO_BETS)] \
+        if bet in CASINO_BETS else CASINO_BETS[0]
+    return [
+        _casino_row(
+            _casino_btn(_casino_cid("slots", uid, bet), f"スロット {bet}", 1, "🎰"),
+            _casino_btn(_casino_cid("coin_view", uid, bet), f"コイントス {bet}", 1, "🪙"),
+            _casino_btn(_casino_cid("dice", uid, bet), f"ダイス {bet}", 1, "🎲"),
+            _casino_btn(_casino_cid("bj_start", uid, bet), f"ブラックジャック {bet}", 1, "🃏")),
+        _casino_row(
+            _casino_btn(_casino_cid("bet", uid, bet), f"賭け金切替 → {nxt}", 2, "💱"),
+            _casino_btn(_casino_cid("daily", uid, bet), "デイリー受取", 2, "💰"),
+            _casino_btn(_casino_cid("shop", uid, bet), "ショップ", 2, "🛒"),
+            _casino_btn(_casino_cid("ranking", uid, bet), "ランキング", 2, "🏆")),
+        _casino_row(
+            _casino_btn(_casino_cid("close", uid, bet), "閉じる", 4)),
+    ]
+
+
+def _casino_item_name(rec: dict, iid: str) -> str:
+    names = rec.get("item_names") or {}
+    if iid in names:
+        return str(names[iid])
+    item = CASINO_SHOP_BY_ID.get(iid)
+    return item["name"] if item else iid
+
+
+def _casino_items_text(rec: dict) -> str:
+    items = [_casino_item_name(rec, i) for i in rec.get("items", [])]
+    return "、".join(items) if items else "なし"
+
+
+def casino_embed(guild_id: int, uid: int, display: str, view: str = "main",
+                 bet: int = 100, note: str = None) -> dict:
+    rec = casino_user(guild_id, uid, display)
+    if view == "shop":
+        lines = ["コインと交換できるのはBot内のバッジ・称号だけ。"
+                 "換金・譲渡・現実の商品との交換はできません。\n"]
+        for i, it in enumerate(CASINO_SHOP):
+            owned = "（所有済み）" if it["id"] in rec.get("items", []) else ""
+            lines.append(f"**{i + 1}. {it['name']}** — {it['price']:,} 2009コイン{owned}\n"
+                         f"　{it['desc']}")
+        desc = "\n".join(lines)
+        if note:
+            desc = f"{note}\n\n" + desc
+        return {"title": "🛒 カジノショップ",
+                "description": desc[:4000],
+                "footer": {"text": f"残高 {rec['balance']:,} 2009コイン"}}
+    if view == "ranking":
+        users = sorted(_casino_data(guild_id)["users"].items(),
+                       key=lambda kv: kv[1].get("balance", 0), reverse=True)
+        lines = [f"{i + 1}. {r.get('name', '?')} — {r.get('balance', 0):,} 2009コイン"
+                 for i, (_, r) in enumerate(users[:10])]
+        return {"title": "🏆 カジノランキング",
+                "description": "\n".join(lines) or "まだ誰も遊んでないわ",
+                "footer": {"text": "残高ランキング（上位10人）"}}
+    if view == "coin":
+        desc = f"表か裏か、当てれば賭け金の1.9倍。賭け金は {bet:,} 2009コイン。"
+        if note:
+            desc = f"{note}\n\n" + desc
+        return {"title": "🪙 コイントス", "description": desc,
+                "footer": {"text": f"残高 {rec['balance']:,} 2009コイン"}}
+    lines = []
+    if note:
+        lines.append(note)
+        lines.append("")
+    lines += [
+        f"**残高： {rec['balance']:,} 2009コイン**（賭け金 {bet:,}）",
+        f"所持アイテム： {_casino_items_text(rec)}",
+        f"戦績： {rec.get('games', 0)} ゲーム / 累計ベット {rec.get('total_wagered', 0):,} / "
+        f"累計獲得 {rec.get('total_won', 0):,}",
+        "",
+        "遊び方：下のボタンでゲームを選ぶだけ。デイリー（毎日+500）と"
+        "発言（1分ごと+2）でコインは貯まる。",
+        "コインは無料で配るBot内専用ポイント。購入・換金・譲渡・"
+        "現実の商品との交換はできません。",
+    ]
+    return {"title": "🎰 #2009 Casino", "description": "\n".join(lines)[:4000],
+            "footer": {"text": "パネルは開いた本人のボタンだけ反応します"}}
+
+
+def casino_bj_embed(session: dict, note: str = None) -> dict:
+    pv = bj_hand_value(session["player"])
+    dealer = session["dealer"]
+    if session.get("finished"):
+        dshow = " ".join(dealer) + f"（{bj_hand_value(dealer)}）"
+    else:
+        dshow = f"{dealer[0]} 🂠"
+    lines = []
+    if note:
+        lines.append(note)
+        lines.append("")
+    lines += [f"あなたの手札： {' '.join(session['player'])}（{pv}）",
+              f"ディーラー： {dshow}",
+              f"賭け金： {session['bet']:,} 2009コイン"]
+    if not session.get("finished"):
+        lines.append("ヒットで1枚引く、スタンドで勝負。21を超えたらバーストで負け。")
+    return {"title": "🃏 ブラックジャック", "description": "\n".join(lines)}
+
+
+async def casino_open_panel(channel_id: int, guild_id: int, user_id: int,
+                            display: str, store: GuildStore = None,
+                            reply_to: int = None):
+    casino_sweep_sessions(guild_id, user_id)
+    casino_user(guild_id, user_id, display)
+    msg = await rest.send_message(
+        channel_id, None,
+        embeds=[casino_embed(guild_id, user_id, display)],
+        components=casino_components("main", user_id, CASINO_BETS[1]),
+        reply_to=reply_to)
+    st = channel_state[channel_id]
+    st["last_bot_msg"] = time.time()
+    st["last_ambient"] = time.time()
+    if store is not None:
+        store.add({"id": 0, "author": rest.bot_name or "Bot",
+                   "author_id": rest.bot_id or 0,
+                   "content": "（カジノのパネルを開いた）",
+                   "channel_id": channel_id, "ts": time.time()})
+    return msg
+
+
+async def try_casino_trigger(channel_id: int, content: str, d: dict,
+                             store: GuildStore) -> bool:
+    """Mechanical casino path: 'カジノしたい' opens the button panel.
+    Returns True when it handled the message."""
+    if not casino_wants(content):
+        return False
+    guild_id = channel_guild.get(channel_id) or MAIN_GUILD_ID
+    author = d.get("author", {})
+    member = d.get("member") or {}
+    display = (member.get("nick") or author.get("global_name")
+               or author.get("username", "?"))
+    web_url = (CFG.get("casino_web_url") or "").strip()
+    if web_url:
+        from urllib.parse import quote
+        sess, reused = casino_issue_session(guild_id, int(author["id"]), display)
+        link = (f"{web_url}#s={sess['sid']}&b={sess['locked']}"
+                f"&u={quote(display)}")
+        head = ("前のセッションまだ有効だから同じリンク使って" if reused
+                else "Webカジノのセッション作ったわ")
+        text = (f"🎰 {head}\n"
+                f"残高 {sess['locked']:,} 2009コインを持ち込んで、2時間有効。\n"
+                f"▶ {link}\n"
+                "終わったらサイトの「精算コードを発行」を押して、"
+                "出てきたコードをこのチャットに貼って。精算しないまま"
+                "期限が切れたら持ち込み分は自動で残高に戻るわ")
+        await rest.send_message(channel_id, text,
+                                reply_to=int(d["id"]) if d.get("id") else None)
+        st = channel_state[channel_id]
+        st["last_bot_msg"] = time.time()
+        st["last_ambient"] = time.time()
+        if store is not None:
+            store.add({"id": 0, "author": rest.bot_name or "Bot",
+                       "author_id": rest.bot_id or 0,
+                       "content": "（Webカジノのセッションリンクを送った）",
+                       "channel_id": channel_id, "ts": time.time()})
+        return True
+    await casino_open_panel(channel_id, guild_id, int(author["id"]), display,
+                            store=store,
+                            reply_to=int(d["id"]) if d.get("id") else None)
+    return True
+
+
+async def handle_casino_component(d: dict):
+    """Button presses on a casino panel (interaction type 3)."""
+    data = d.get("data") or {}
+    parts = (data.get("custom_id") or "").split(":")
+    if len(parts) < 3 or parts[0] != "casino":
+        return
+    action = parts[1]
+    try:
+        owner_id = int(parts[2])
+    except ValueError:
+        return
+    muser = ((d.get("member") or {}).get("user") or d.get("user") or {})
+    presser = int(muser.get("id", 0) or 0)
+    guild_id = int(d["guild_id"]) if d.get("guild_id") else MAIN_GUILD_ID
+    message_id = int((d.get("message") or {}).get("id", 0) or 0)
+    member = d.get("member") or {}
+    display = (member.get("nick") or muser.get("global_name")
+               or muser.get("username", "?"))
+    if presser != owner_id:
+        await interaction_callback(d, 4, {
+            "content": "それは他人のパネルだわ。自分の分は『カジノしたい』って言って開け",
+            "flags": 64})
+        return
+    uid = presser
+    casino_user(guild_id, uid, display)
+    bet = CASINO_BETS[1]
+    if len(parts) > 3 and parts[3].isdigit():
+        bet = int(parts[3])
+
+    async def update(view, note=None, b=None):
+        bb = bet if b is None else b
+        await interaction_callback(d, 7, {
+            "embeds": [casino_embed(guild_id, uid, display, view, bb, note)],
+            "components": casino_components(view, uid, bb)})
+
+    if action == "close":
+        bj_sessions.pop(message_id, None)
+        await interaction_callback(d, 7, {
+            "content": "🎰 閉じたわ。また『カジノしたい』で開ける",
+            "embeds": [], "components": []})
+        return
+    if action == "main":
+        bj_sessions.pop(message_id, None)
+        await update("main")
+        return
+    if action == "bet":
+        nxt = CASINO_BETS[(CASINO_BETS.index(bet) + 1) % len(CASINO_BETS)] \
+            if bet in CASINO_BETS else CASINO_BETS[0]
+        await update("main", f"賭け金を {nxt:,} にしたわ", nxt)
+        return
+    if action == "daily":
+        _, msg = casino_claim_daily(guild_id, uid)
+        await update("main", msg)
+        return
+    if action == "shop":
+        await update("shop")
+        return
+    if action == "buy":
+        item_id = parts[4] if len(parts) > 4 else ""
+        _, msg = casino_buy(guild_id, uid, item_id)
+        await update("shop", msg)
+        return
+    if action == "ranking":
+        await update("ranking")
+        return
+    if action == "coin_view":
+        await update("coin")
+        return
+    if action == "slots":
+        reels, payout = slot_spin(bet)
+        try:
+            rec = casino_settle(guild_id, uid, bet, payout)
+        except CasinoError as e:
+            await update("main", str(e))
+            return
+        shown = " ".join(reels)
+        if payout > bet:
+            note = f"{shown}　当たり！ +{payout - bet:,} 2009コイン（残高 {rec['balance']:,}）"
+        elif payout == bet:
+            note = f"{shown}　賭け金は戻ったわ（残高 {rec['balance']:,}）"
+        elif payout > 0:
+            note = f"{shown}　ペアで少し戻ったわ -{bet - payout:,}（残高 {rec['balance']:,}）"
+        else:
+            note = f"{shown}　ハズレ。-{bet:,} 2009コイン（残高 {rec['balance']:,}）"
+        await update("main", note)
+        return
+    if action == "coin":
+        choice = parts[4] if len(parts) > 4 else "h"
+        flip, payout = coin_flip(bet, choice)
+        try:
+            rec = casino_settle(guild_id, uid, bet, payout)
+        except CasinoError as e:
+            await update("coin", str(e))
+            return
+        names = {"h": "表", "t": "裏"}
+        if payout:
+            note = (f"結果は {names[flip]}！ 当たり +{payout - bet:,} 2009コイン"
+                    f"（残高 {rec['balance']:,}）")
+        else:
+            note = (f"結果は {names[flip]}… ハズレ。-{bet:,} 2009コイン"
+                    f"（残高 {rec['balance']:,}）")
+        await update("coin", note)
+        return
+    if action == "dice":
+        me, bot, payout = dice_duel(bet)
+        try:
+            rec = casino_settle(guild_id, uid, bet, payout)
+        except CasinoError as e:
+            await update("main", str(e))
+            return
+        if me > bot:
+            note = f"🎲 あなた {me} vs 僕 {bot}　勝ち！ +{payout - bet:,} 2009コイン（残高 {rec['balance']:,}）"
+        elif me == bot:
+            note = f"🎲 あなた {me} vs 僕 {bot}　引き分け、賭け金は戻したわ（残高 {rec['balance']:,}）"
+        else:
+            note = f"🎲 あなた {me} vs 僕 {bot}　負け。-{bet:,} 2009コイン（残高 {rec['balance']:,}）"
+        await update("main", note)
+        return
+    if action == "bj_start":
+        if message_id in bj_sessions:
+            await update("main", "そのパネルではもうブラックジャック中だわ")
+            return
+        rec = casino_user(guild_id, uid, display)
+        if rec["balance"] < bet:
+            await update("main", f"残高不足だわ（残高 {rec['balance']:,} / 賭け金 {bet:,}）")
+            return
+        rec["balance"] -= bet
+        rec["total_wagered"] += bet
+        rec["games"] += 1
+        deck = bj_new_deck()
+        session = {"guild_id": guild_id, "user_id": uid, "bet": bet,
+                   "deck": deck, "player": [deck.pop(), deck.pop()],
+                   "dealer": [deck.pop(), deck.pop()], "finished": False}
+        pv = bj_hand_value(session["player"])
+        if pv == 21:
+            if bj_hand_value(session["dealer"]) == 21:
+                payout, note = bet, "両方ブラックジャック… 引き分け、賭け金は戻したわ"
+            else:
+                payout, note = int(bet * 2.5), f"ブラックジャック！ +{int(bet * 1.5):,} 2009コイン"
+            rec["balance"] += payout
+            rec["total_won"] += payout
+            _casino_save(guild_id)
+            session["finished"] = True
+            await interaction_callback(d, 7, {
+                "embeds": [casino_bj_embed(session, note)],
+                "components": casino_components("main", uid, bet)})
+            return
+        _casino_save(guild_id)
+        bj_sessions[message_id] = session
+        await interaction_callback(d, 7, {
+            "embeds": [casino_bj_embed(session)],
+            "components": casino_components("bj", uid, bet)})
+        return
+    if action in ("bj_hit", "bj_stand"):
+        session = bj_sessions.get(message_id)
+        if session is None or session["user_id"] != uid:
+            await interaction_callback(d, 4, {
+                "content": "その勝負はもう終わってるか、再起動で消えたわ。パネル開き直して",
+                "flags": 64})
+            return
+        if action == "bj_hit":
+            session["player"].append(session["deck"].pop())
+            if bj_hand_value(session["player"]) <= 21:
+                await interaction_callback(d, 7, {
+                    "embeds": [casino_bj_embed(session)],
+                    "components": casino_components("bj", uid, bet)})
+                return
+        payout, note = bj_resolve(session)
+        rec = casino_user(guild_id, uid, display)
+        rec["balance"] += payout
+        rec["total_won"] += payout
+        _casino_save(guild_id)
+        session["finished"] = True
+        bj_sessions.pop(message_id, None)
+        note = f"{note}（残高 {rec['balance']:,}）"
+        await interaction_callback(d, 7, {
+            "embeds": [casino_bj_embed(session, note)],
+            "components": casino_components("main", uid, bet)})
+        return
+
+
 FALLBACK_ACKS = ["何？", "ん？", "呼んだ？", "おう", "何だって？", "はいはい"]
 
 
@@ -2481,6 +3287,12 @@ async def handle_dm(d: dict):
     if st.get("para_active") and STOP_RE.search(content):
         st["para_stop"] = True
         return
+    if await try_casino_settle(channel_id, content, d, store):
+        record_trigger(st, int(author.get("id", 0)), content)
+        return
+    if await try_casino_trigger(channel_id, content, d, store):
+        record_trigger(st, int(author.get("id", 0)), content)
+        return
     if await try_fetch_media(channel_id, content, d, store):
         record_trigger(st, int(author.get("id", 0)), content)
         return
@@ -2576,6 +3388,7 @@ async def handle_message(d: dict):
                    "channel_id": channel_id, "ts": time.time()})
         if st.get("para_active") and STOP_RE.search(content):
             st["para_stop"] = True
+        casino_chat_reward(guild_id, int(author["id"]))
         update_heat(st, int(author["id"]), content)
         if store.profile_due():
             asyncio.create_task(refresh_profile(store))
@@ -2586,6 +3399,12 @@ async def handle_message(d: dict):
     if (content or has_image) and not channel_speaking(guild_id, channel_id):
         return
     if content and not st["paused"]:
+        if await try_casino_settle(channel_id, content, d, store):
+            record_trigger(st, int(author["id"]), content)
+            return
+        if await try_casino_trigger(channel_id, content, d, store):
+            record_trigger(st, int(author["id"]), content)
+            return
         if await try_fetch_media(channel_id, content, d, store):
             record_trigger(st, int(author["id"]), content)
             return
@@ -2703,6 +3522,7 @@ COMMAND_DEFS = [
     {"name": "ミーム削除", "type": 1, "description": "追加したミームを番号で削除（自分にだけ見えます）",
      "options": [_opt_i("番号", "ミーム一覧の番号", True)]},
     {"name": "モデル使用量", "type": 1, "description": "各モデルの使用量と、今使えるかどうかをチェックする"},
+    {"name": "カジノ", "type": 1, "description": "仮想コインのカジノパネルを開く（スロット等・換金不可のBot内ポイント）"},
     {"name": "発言切替", "type": 1, "description": "Botの発言オン/オフを切り替える（管理者のみ）",
      "default_member_permissions": "8",
      "options": [{"name": "状態", "type": 3, "required": False,
